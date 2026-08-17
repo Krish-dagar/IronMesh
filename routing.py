@@ -11,17 +11,9 @@ PeerTable
 
 RoutingSwitch
     Given a ``Context`` (intent urgency) and the current node's own state,
-    decides whether to handle a request locally or forward it to a peer:
-
-    - Every live peer is scored: headroom - queue penalty - RTT penalty.
-    - High-urgency intents prefer the *fastest* reachable peer (lowest RTT
-      among peers with sufficient headroom) so latency stays low.
-    - Low-urgency intents prefer the *most idle* peer so bulk work lands
-      where capacity is cheapest.
-    - If no peer is worth it, fall back to the local queue. The local node
-      keeps control when it is HEALTHY and the context is not urgent.
-    - TTL / hop-count budgeting (``Context.alive()``) guarantees a payload
-      is never forwarded in a loop.
+    decides whether to handle a request locally or forward it to a peer.
+    Actively hunts for the most idle or fastest peer to ensure a true mesh
+    topology and distribute work across the network.
 """
 
 from __future__ import annotations
@@ -169,44 +161,33 @@ class RoutingSwitch:
         local_snapshot: MetricsSnapshot,
         local_jammed: bool,
     ) -> tuple:
-        """Return ``(target, reason)`` where target is ``"local"`` or a peer.
-
-        target == "local" means the payload is processed on this node;
-        otherwise a Peer to forward to.
-        """
+        """Return ``(target, reason)`` where target is ``"local"`` or a peer."""
+        # Stop routing if it's bounced around too many times
         if not ctx.alive() or ctx.hop_count >= self._max_hops:
             return "local", "ttl-budget-exhausted"
 
         live = self._table.live()
-        local_ok = not local_jammed
+        candidates = [p for p in live if p.score(self._min_headroom) is not None]
+
+        # No peers available? We have to do it ourselves.
+        if not candidates:
+            return "local", "no-peer-capacity"
+
+        local_headroom = local_snapshot.headroom() if local_snapshot else 0.0
 
         if ctx.urgency == "high":
-            # Urgent traffic is served by whichever node is fastest to
-            # answer. A healthy node is the fastest path for itself, so we
-            # keep urgent work local there - offloading healthy nodes caused
-            # forwarding loops in the mesh. A jammed node hands urgent work
-            # to the fastest peer with headroom instead of queueing it.
-            if not local_ok:
-                candidates = [p for p in live if p.score(self._min_headroom) is not None]
-                if candidates:
-                    best = min(candidates, key=lambda p: p.rtt_s)
-                    return best, "urgent-offload-local-jammed"
-                return "local", "urgent-no-peer-capacity"
-            return "local", "urgent-local-healthy"
+            best = min(candidates, key=lambda p: p.rtt_s)
+            # TRUE MESH: If we have ANY queue at all, instantly reroute to the fastest peer.
+            if local_jammed or local_snapshot.queue_depth > 0:
+                return best, "urgent-mesh-reroute"
+            return "local", "urgent-local-idle"
         else:
-            # Bulk / non-urgent: most idle peer (max headroom) absorbs it.
-            candidates = [p for p in live if p.score(self._min_headroom) is not None]
-            if not candidates:
-                return "local", "bulk-no-peer-capacity"
-            if local_jammed:
-                best = max(candidates, key=lambda p: p.snapshot.headroom())
-                return best, "bulk-offload-local-jammed"
-            # Local node healthy: keep bulk work local to avoid gratuitous hops.
-            if local_snapshot.headroom() >= 30.0:
-                return "local", "bulk-local-idle"
             best = max(candidates, key=lambda p: p.snapshot.headroom())
-            if best.snapshot.headroom() > local_snapshot.headroom() + 10:
-                return best, "bulk-offload-peer-idler"
+            # TRUE MESH: Actively hunt for the most idle node. If a peer has just 5% more free space than us, forward it.
+            if best.snapshot.headroom() > local_headroom + 5.0:
+                return best, "bulk-mesh-reroute"
+            if local_jammed:
+                return best, "bulk-offload-jammed"
             return "local", "bulk-local-balanced"
 
     def validate_hop(self, ctx: Context) -> bool:

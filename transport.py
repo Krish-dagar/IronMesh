@@ -10,9 +10,11 @@ Three cooperating parts:
 
 2. ``NodeHttpServer``
    A threaded ``http.server`` instance exposing the data/control endpoints:
-   ``POST /submit``, ``POST /route``, ``POST /heartbeat``, ``GET /health``,
-   ``GET /peers``, ``GET /metrics``, ``GET /connections``, ``GET /messages``. All request logic is delegated to the
-   injected ``app`` (see node.py / pipeline.py); this module stays I/O-only.
+   ``POST /submit``, ``POST /route``, ``POST /heartbeat``, ``POST /trigger-hop``,
+   ``POST /jam``, ``GET /health``, ``GET /peers``, ``GET /metrics``, 
+   ``GET /connections``, ``GET /messages``, ``GET /spectrum``. All request logic 
+   is delegated to the injected ``app`` (see node.py / pipeline.py); this module 
+   stays I/O-only.
 
 3. ``GossipLoop``
    Periodically POSTs our metrics snapshot to every known peer (and any
@@ -135,8 +137,6 @@ class UDPDiscovery(threading.Thread):
             self._log.debug("announce send failed %s: %s", addr, exc)
 
     def run(self) -> None:
-        # Continuous receiver loop (announce broadcasts also drive sending
-        # so a single socket does both discovery and reply).
         while not self._stop.is_set():
             try:
                 data, addr = self._rx.recvfrom(65535)
@@ -150,8 +150,6 @@ class UDPDiscovery(threading.Thread):
                     port = int(msg.get("http_port", 0))
                     if nid and nid != self._node_id and port > 0:
                         self._on_peer(nid, host, port)
-                        # Reply unicast so the sender learns about us even if
-                        # broadcast is one-way (directed broadcast disabled).
                         self._send_to((addr[0], self._udp_port))
             except socket.timeout:
                 pass
@@ -222,19 +220,23 @@ class _NodeHandler(BaseHTTPRequestHandler):
             self._json(200, app.on_peers())
         elif path == "/metrics":
             self._json(200, app.on_metrics())
+        elif path == "/spectrum":
+            self._json(200, {
+                "node_id": getattr(app, "node_id", "unknown_node"),
+                "current_channel": getattr(app, "current_channel", "2.412 GHz (Ch 1)"),
+                "is_jammed": getattr(app, "is_jammed", False),
+                "jamming_events": getattr(app, "jamming_events", [])
+            })
         elif path == "/connections":
             try:
-                # Extract live connected peers directly from app state
                 peers_data = []
                 if hasattr(app, "peers"):
-                    # Check if peers stored as dict in self.peers.peers or self.peers
                     raw_peers = getattr(app.peers, "peers", app.peers)
                     if isinstance(raw_peers, dict):
                         peers_data = list(raw_peers.values())
                     elif isinstance(raw_peers, list):
                         peers_data = raw_peers
 
-                # Extract connection history if logged, fallback to formatted active connections
                 conn_history = getattr(app, "connection_logs", [])
                 if not conn_history and peers_data:
                     conn_history = []
@@ -305,6 +307,31 @@ class _NodeHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/heartbeat":
             resp = app.on_heartbeat(body)
             self._json(200, resp)
+        elif parsed.path == "/trigger-hop":
+            if hasattr(app, "trigger_frequency_hop"):
+                event = app.trigger_frequency_hop(reason="Dashboard Manual Command")
+                self._json(200, {"status": "SUCCESS", "event": event})
+            else:
+                self._json(500, {"status": "error", "message": "Frequency hopper not initialized on node"})
+        elif parsed.path in ("/jam", "/simulate-jam"):
+            event = None
+            if hasattr(app, "trigger_jamming"):
+                event = app.trigger_jamming()
+            elif hasattr(app, "simulate_jamming"):
+                event = app.simulate_jamming()
+            else:
+                # Direct attribute fallbacks
+                app.is_jammed = True
+                event = {
+                    "timestamp": time.time(),
+                    "channel": getattr(app, "current_channel", "Ch 1"),
+                    "reason": "Simulated jamming payload injected via HTTP"
+                }
+                if hasattr(app, "jamming_events") and isinstance(app.jamming_events, list):
+                    app.jamming_events.append(event)
+                else:
+                    app.jamming_events = [event]
+            self._json(200, {"status": "SUCCESS", "jammed": True, "event": event})
         else:
             self._json(404, {"status": "error", "error": "not found"})
 
@@ -363,8 +390,6 @@ class GossipLoop(threading.Thread):
         self._http_port = http_port
         self._table = peer_table
         self._snapshot = snapshot_provider
-        # Drop seeds that point at ourselves (same port on localhost) to avoid
-        # self-heartbeat loops.
         self._seeds = [
             (h, p)
             for (h, p) in (seed_endpoints or [])
@@ -396,8 +421,7 @@ class GossipLoop(threading.Thread):
             return
         if isinstance(resp, dict) and resp.get("node_id"):
             if resp["node_id"] == self._node_id:
-                return  # seed endpoint pointed back at ourselves
-            # We now know the peer's identity -> upsert so future gossip flows.
+                return
             peer = self._table.upsert(
                 str(resp["node_id"]), host, port
             )
@@ -409,7 +433,6 @@ class GossipLoop(threading.Thread):
                 for peer in self._table.live():
                     if peer.node_id != self._node_id:
                         self._send_heartbeat(peer.host, peer.port)
-                # Confirm static seeds that aren't yet covered by a live peer.
                 for (host, port) in list(self._seeds):
                     if not self._covered(host, port):
                         self._send_heartbeat(host, port)

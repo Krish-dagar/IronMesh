@@ -10,42 +10,18 @@ to be one of the nodes), then open the dashboard in a browser.
     python3 dashboard.py --port 9000 --node localhost:8080
 
 Then visit:  http://localhost:9000
-
-How this works
----------------------------------------------------------------------
-Rather than trust the "state" and "alive" fields nodes gossip about each
-other (node.py never actually fills "state" into the heartbeat, which is
-why it always shows "unknown"), this dashboard crawls the mesh itself:
-starting from --node, it asks that node's /metrics for its peer list,
-then directly asks each of *those* nodes for their own /health + /metrics
-too (one hop out, breadth-first), and keeps going until it runs out of
-newly-discovered peers or hits the hop/node cap. Every node's real state
-comes straight from that node's own /health, not from gossip.
-
-Nodes are tracked by host:port, not by node_id. node_id gets a fresh
-random suffix every time node.py restarts (see identity.py), so keying
-on it makes a reconnecting laptop look like a brand new node. host:port
-is the same laptop's actual network identity across restarts, so a node
-that goes down and comes back updates the *same* row/graph point instead
-of spawning a duplicate.
-
-A browser page also can't fetch a different origin (like localhost:8080)
-without CORS headers, which the node's server doesn't send - so this
-script does all the fetching in Python and hands the browser a
-same-origin "/api/topology" endpoint to poll instead.
-
-Stdlib only, matching the rest of this project - no installs needed.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import socket
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
 DEFAULT_NODE = "localhost:8080"
 DEFAULT_PORT = 9000
@@ -53,7 +29,7 @@ REQUEST_TIMEOUT_S = 1.5
 DEFAULT_HOPS = 2
 MAX_NODES = 40
 
-_resolve_cache: dict = {}
+_resolve_cache: dict[str, str] = {}
 
 
 def fetch_json(url: str) -> dict:
@@ -62,9 +38,14 @@ def fetch_json(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def post_json(url: str) -> dict:
+    req = urllib.request.Request(url, method="POST", headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def _resolve_host(host: str) -> str:
-    """Resolve a hostname to an IP so 'localhost' and '127.0.0.1' (or a
-    machine's hostname and its LAN IP) collapse to the same graph key."""
+    """Resolve a hostname to an IP so 'localhost' and '127.0.0.1' collapse to the same key."""
     if host in _resolve_cache:
         return _resolve_cache[host]
     try:
@@ -75,7 +56,7 @@ def _resolve_host(host: str) -> str:
     return ip
 
 
-def parse_hostport(addr: str):
+def parse_hostport(addr: str) -> tuple[str, str]:
     a = addr.strip()
     if a.startswith("http://"):
         a = a[7:]
@@ -89,12 +70,12 @@ def parse_hostport(addr: str):
     return host, port
 
 
-def normalize_addr(host: str, port) -> str:
+def normalize_addr(host: str, port: str | int) -> str:
     return "{}:{}".format(_resolve_host(str(host)), port)
 
 
 def probe(addr: str) -> dict:
-    """Directly ask one node (host:port) for its own health + metrics."""
+    """Directly ask one node (host:port) for its own health, metrics, connections, and spectrum."""
     base = addr.strip()
     if not base.startswith("http://") and not base.startswith("https://"):
         base = "http://" + base
@@ -105,27 +86,28 @@ def probe(addr: str) -> dict:
         out["health"] = fetch_json(base + "/health")
     except Exception as exc:
         out["health_error"] = str(exc)
+
     try:
         out["metrics"] = fetch_json(base + "/metrics")
         out["ok"] = True
     except Exception as exc:
         out["metrics_error"] = str(exc)
+
     try:
         out["connections"] = fetch_json(base + "/connections")
     except Exception as exc:
         out["connections_error"] = str(exc)
+
+    try:
+        out["spectrum"] = fetch_json(base + "/spectrum")
+    except Exception as exc:
+        out["spectrum_error"] = str(exc)
+
     return out
 
 
 def crawl(root_addr: str, hops: int = DEFAULT_HOPS, max_nodes: int = MAX_NODES) -> dict:
-    """Breadth-first crawl of the mesh starting at root_addr.
-
-    Returns {"root": addr, "visited": {addr: probe_result}, "edges": [...]}.
-    Each edge is one node's own report of a peer it knows about, carrying
-    whatever that node's peer table said (alive, rtt_ms, headroom, state,
-    fail_count) - this is the freshest first-hand signal available for
-    any node we couldn't reach directly ourselves.
-    """
+    """Breadth-first crawl of the mesh starting at root_addr."""
     visited: dict = {}
     edges: list = []
     root_key = normalize_addr(*parse_hostport(root_addr))
@@ -158,7 +140,6 @@ def crawl(root_addr: str, hops: int = DEFAULT_HOPS, max_nodes: int = MAX_NODES) 
 
 
 def device_name(node_id: str) -> str:
-    import re
     if not node_id:
         return ""
     m = re.match(r"^node-(.+)-[0-9a-f]{12}$", node_id, re.IGNORECASE)
@@ -166,7 +147,7 @@ def device_name(node_id: str) -> str:
 
 
 def compose_graph(crawl_result: dict) -> dict:
-    """Turn a crawl into a flat {nodes, edges, root} graph keyed by host:port."""
+    """Turn a crawl result into a flat graph keyed by canonical host:port."""
     visited = crawl_result["visited"]
     root = crawl_result["root"]
     nodes: dict = {}
@@ -186,10 +167,11 @@ def compose_graph(crawl_result: dict) -> dict:
                 "queue_depth": None,
                 "uptime_s": None,
                 "connections": [],
+                "spectrum": {},
             }
         return nodes[addr]
 
-    # Directly-probed nodes: ground truth, straight from their own /health.
+    # Directly-probed nodes ground truth
     for addr, result in visited.items():
         n = ensure(addr)
         health = result.get("health") or {}
@@ -199,8 +181,13 @@ def compose_graph(crawl_result: dict) -> dict:
         n["node_id"] = node_id
         n["device_name"] = device_name(node_id)
         n["reachable"] = bool(result.get("ok"))
+        n["spectrum"] = result.get("spectrum") or {}
         if n["reachable"]:
-            n["state"] = health.get("state", "unknown")
+            # If spectrum endpoint reports jammed, reflect jammed state
+            if n["spectrum"].get("is_jammed"):
+                n["state"] = "jammed"
+            else:
+                n["state"] = health.get("state", "unknown")
             n["headroom"] = snap.get("headroom")
             n["load"] = health.get("load", snap.get("load_score"))
             n["queue_depth"] = health.get("queue_depth", snap.get("queue_depth"))
@@ -208,8 +195,7 @@ def compose_graph(crawl_result: dict) -> dict:
             conns = result.get("connections") or {}
             n["connections"] = conns.get("connections") or []
 
-    # Fill in anything only known second-hand (a peer's report of a node
-    # we couldn't reach ourselves) - best available signal, clearly weaker.
+    # Fill second-hand peer reported details
     for e in crawl_result["edges"]:
         p = e["peer"]
         pkey = e["b"]
@@ -228,14 +214,7 @@ def compose_graph(crawl_result: dict) -> dict:
         if n["fail_count"] is None and p.get("fail_count") is not None:
             n["fail_count"] = p.get("fail_count")
 
-    # Some nodes get discovered under more than one host:port - e.g. two
-    # node.py processes running on the same physical laptop (different
-    # ports) each mint their own random node_id (see identity.py), but
-    # they share the same hostname/device_name. From a "which laptops are
-    # on the mesh" point of view that's one machine, so collapse any addrs
-    # that share a device_name down to one canonical entry, preferring the
-    # root's own addr, then any directly-reachable addr. Nodes with no
-    # device_name (couldn't be identified at all) are left alone.
+    # Deduplicate canonical devices running on same machine
     def _dkey(name: str) -> str:
         return name.strip().casefold()
 
@@ -268,7 +247,7 @@ def compose_graph(crawl_result: dict) -> dict:
             continue
         dst = merged_nodes[cadd]
         if n.get("reachable") and not dst.get("reachable"):
-            for k in ("state", "headroom", "load", "queue_depth", "uptime_s", "connections"):
+            for k in ("state", "headroom", "load", "queue_depth", "uptime_s", "connections", "spectrum"):
                 dst[k] = n.get(k)
             dst["reachable"] = True
         for k in ("rtt_ms", "fail_count", "reported_alive"):
@@ -279,10 +258,7 @@ def compose_graph(crawl_result: dict) -> dict:
 
     root = addr_to_canonical.get(root, root)
 
-    # Collapse duplicate edges between the same pair of addrs into one,
-    # OR-ing "alive" (if anyone can see it up, treat the link as up), and
-    # remap endpoints through the same canonical-address mapping so a
-    # merged node doesn't leave behind a stray extra dot in the graph.
+    # Edge deduplication
     merged_edges: dict = {}
     for e in crawl_result["edges"]:
         a = addr_to_canonical.get(e["a"], e["a"])
@@ -305,7 +281,7 @@ def compose_graph(crawl_result: dict) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):  # keep the console quiet
+    def log_message(self, fmt, *args):
         pass
 
     def _send(self, code: int, body: bytes, content_type: str) -> None:
@@ -334,6 +310,27 @@ class Handler(BaseHTTPRequestHandler):
             graph = compose_graph(result)
             body = json.dumps(graph).encode("utf-8")
             self._send(200, body, "application/json")
+            return
+
+        self._send(404, b"not found", "text/plain")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        node_addr = (qs.get("node") or [self.server.default_node])[0]  # type: ignore[attr-defined]
+        
+        base = node_addr.strip()
+        if not base.startswith("http://") and not base.startswith("https://"):
+            base = "http://" + base
+        base = base.rstrip("/")
+
+        if parsed.path in ("/api/jam", "/api/trigger-hop"):
+            endpoint = "/jam" if parsed.path == "/api/jam" else "/trigger-hop"
+            try:
+                res = post_json(base + endpoint)
+                self._send(200, json.dumps(res).encode("utf-8"), "application/json")
+            except Exception as exc:
+                self._send(500, json.dumps({"error": str(exc)}).encode("utf-8"), "application/json")
             return
 
         self._send(404, b"not found", "text/plain")
@@ -418,13 +415,15 @@ PAGE = """<!doctype html>
 
   .banner {
     display: none;
-    background: rgba(240,84,107,0.12);
-    border: 1px solid rgba(240,84,107,0.4);
+    background: rgba(240,84,107,0.18);
+    border: 1px solid rgba(240,84,107,0.5);
     color: #ffb3c0;
-    padding: 10px 14px;
+    padding: 12px 16px;
     border-radius: 10px;
-    font-size: 13px;
+    font-size: 13.5px;
+    font-weight: 600;
     margin-bottom: 18px;
+    text-align: center;
   }
   .banner.show { display: block; }
 
@@ -456,8 +455,8 @@ PAGE = """<!doctype html>
     border: 1px solid transparent;
   }
   .badge .d { width: 7px; height: 7px; border-radius: 50%; }
-  .badge.healthy { color: var(--good); background: rgba(61,220,132,0.12); border-color: rgba(61,220,132,0.35); }
-  .badge.healthy .d { background: var(--good); box-shadow: 0 0 6px var(--good); }
+  .badge.healthy, .badge.operational { color: var(--good); background: rgba(61,220,132,0.12); border-color: rgba(61,220,132,0.35); }
+  .badge.healthy .d, .badge.operational .d { background: var(--good); box-shadow: 0 0 6px var(--good); }
   .badge.busy { color: var(--warn); background: rgba(245,185,66,0.12); border-color: rgba(245,185,66,0.35); }
   .badge.busy .d { background: var(--warn); box-shadow: 0 0 6px var(--warn); }
   .badge.jammed, .badge.recovering { color: var(--bad); background: rgba(240,84,107,0.12); border-color: rgba(240,84,107,0.35); }
@@ -470,6 +469,28 @@ PAGE = """<!doctype html>
   .stat .label { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.6px; }
   .stat .value { font-family: var(--mono); font-size: 17px; margin-top: 4px; font-weight: 650; }
 
+  .spectrum-ctrl { display: flex; gap: 10px; margin-bottom: 16px; }
+  .btn-jam {
+    background: rgba(240,84,107,0.2);
+    border: 1px solid var(--bad);
+    color: #ffb3c0;
+    font-weight: 650;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .btn-jam:hover { background: rgba(240,84,107,0.35); }
+  .btn-hop {
+    background: rgba(94,234,212,0.2);
+    border: 1px solid var(--accent-2);
+    color: var(--accent-2);
+    font-weight: 650;
+    padding: 8px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .btn-hop:hover { background: rgba(94,234,212,0.35); }
+
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   thead th {
     text-align: left; color: var(--muted); font-size: 10.5px; text-transform: uppercase;
@@ -480,7 +501,6 @@ PAGE = """<!doctype html>
   tbody tr:hover { background: rgba(255,255,255,0.02); }
   tbody tr.indirect { opacity: 0.62; }
   .pname { font-family: var(--sans); font-weight: 600; font-size: 13px; }
-  .pname .you { color: var(--accent-2); font-family: var(--sans); font-weight: 600; font-size: 10.5px; margin-left: 6px; }
   .phost { color: var(--muted); font-size: 11.5px; }
   .indirect-tag { font-family: var(--sans); font-size: 10px; color: var(--muted); }
 
@@ -518,6 +538,7 @@ PAGE = """<!doctype html>
     </div>
   </header>
 
+  <div class="banner" id="jamBanner">🚨 JAMMING DETECTED ON CURRENT CHANNEL! FREQUENCY HOP REQUIRED.</div>
   <div class="banner" id="banner"></div>
 
   <div class="card" id="selfCard">
@@ -530,6 +551,28 @@ PAGE = """<!doctype html>
       <span class="badge unknown" id="selfState"><span class="d"></span>unknown</span>
     </div>
     <div class="stat-grid" id="selfStats"></div>
+  </div>
+
+  <!-- Spectrum Management Card -->
+  <div class="card">
+    <h2>Anti-Jamming & Spectrum Status</h2>
+    <div class="spectrum-ctrl">
+      <button class="btn-jam" onclick="triggerJam()">Simulate Jamming</button>
+      <button class="btn-hop" onclick="triggerHop()">Trigger Frequency Hop</button>
+    </div>
+    <div class="stat-grid" id="spectrumStats"></div>
+    <h2 style="margin-top:16px;">Jamming Event Log</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Event / Reason</th>
+          <th>Channel / Info</th>
+          <th>Time</th>
+        </tr>
+      </thead>
+      <tbody id="jamRows"></tbody>
+    </table>
+    <div class="empty" id="jamEmpty" style="display:none;">No jamming events logged.</div>
   </div>
 
   <div class="card">
@@ -644,6 +687,35 @@ function renderSelf(rootAddr, nodes) {
     stat("Active links", (self.connections || []).filter(c => (c.status || "").toUpperCase() === "CONNECTED").length),
   ];
   document.getElementById("selfStats").innerHTML = stats.join("");
+
+  // Render Spectrum
+  const spec = self.spectrum || {};
+  const isJammed = spec.is_jammed || false;
+  const jamBanner = document.getElementById("jamBanner");
+  if (isJammed) {
+    jamBanner.textContent = "🚨 JAMMING DETECTED ON " + (spec.current_channel || "CHANNEL") + "! FREQUENCY HOP REQUIRED.";
+    jamBanner.classList.add("show");
+  } else {
+    jamBanner.classList.remove("show");
+  }
+
+  const specStats = [
+    stat("Current Channel", spec.current_channel || "-"),
+    stat("Jammed Status", isJammed ? "JAMMED" : "CLEAR"),
+  ];
+  document.getElementById("spectrumStats").innerHTML = specStats.join("");
+
+  const jamEvents = spec.jamming_events || [];
+  const jamRows = jamEvents.map(e => {
+    const timeStr = e.timestamp ? new Date(e.timestamp * 1000).toLocaleTimeString() : "-";
+    return '<tr>' +
+      '<td>' + (e.event || e.reason || "JAM_EVENT") + '</td>' +
+      '<td>' + (e.channel || (e.from_channel ? e.from_channel + ' ➔ ' + e.to_channel : "-")) + '</td>' +
+      '<td>' + timeStr + '</td>' +
+    '</tr>';
+  });
+  document.getElementById("jamRows").innerHTML = jamRows.join("");
+  document.getElementById("jamEmpty").style.display = jamEvents.length ? "none" : "block";
 }
 
 function renderConnections(rootAddr, nodes) {
@@ -714,7 +786,6 @@ function layout(rootAddr, nodes) {
 }
 
 function renderGraph(rootAddr, nodes, edges) {
-  const W = 760, H = 440;
   const pos = layout(rootAddr, nodes);
   let svg = '';
 
@@ -749,6 +820,18 @@ function renderGraph(rootAddr, nodes, edges) {
   });
 
   document.getElementById("graphSvg").innerHTML = svg;
+}
+
+async function triggerJam() {
+  const node = document.getElementById("nodeInput").value.trim() || "localhost:8080";
+  await fetch("/api/jam?node=" + encodeURIComponent(node), { method: "POST" });
+  tick();
+}
+
+async function triggerHop() {
+  const node = document.getElementById("nodeInput").value.trim() || "localhost:8080";
+  await fetch("/api/trigger-hop?node=" + encodeURIComponent(node), { method: "POST" });
+  tick();
 }
 
 async function tick() {

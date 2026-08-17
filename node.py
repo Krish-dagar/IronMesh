@@ -90,7 +90,7 @@ def parse_peers(raw: List[str], default_port: int) -> List[Tuple[str, int]]:
 
 
 class Node:
-    """A single laptop: discovery, gossip, pipeline, HTTP server."""
+    """A single laptop: discovery, gossip, pipeline, HTTP server, tactical anti-jamming."""
 
     def __init__(self, cfg: dict, seed_peers: Optional[List[Tuple[str, int]]] = None):
         self.cfg = cfg
@@ -107,6 +107,17 @@ class Node:
 
         # Connection logs instance storage
         self.connection_logs: List[Dict[str, object]] = []
+
+        # Spectrum / Anti-Jamming Parameters
+        self.channel_list = cfg.get("channel_list", [
+            "2.412 GHz (Ch 1)",
+            "2.437 GHz (Ch 6)",
+            "2.462 GHz (Ch 11)",
+            "5.180 GHz (Ch 36)"
+        ])
+        self.current_channel = self.channel_list[0]
+        self.is_jammed = False
+        self.jamming_events: List[Dict[str, object]] = []
 
         # Feature modules.
         self.state = StateMachine(StateConfig(cfg.get("state", {})))
@@ -142,7 +153,7 @@ class Node:
             queue_depth_provider=self.pipeline.queue_depth,
             rate_provider=self.pipeline.rates,
             logger=log,
-            on_snapshot=self.state.evaluate,
+            on_snapshot=self._on_metrics_snapshot,
         )
         self.pipeline.attach_snapshot(self.metrics.snapshot)
 
@@ -184,6 +195,42 @@ class Node:
         except TypeError:
             return False
 
+    # -- Spectrum & Anti-Jamming Logic --------------------------------------
+
+    def check_jamming_status(self, packet_drop_rate: float) -> None:
+        """Monitors drop rates and triggers frequency hop if drop rate > 50%."""
+        if packet_drop_rate > 0.5 and not self.is_jammed:
+            self.is_jammed = True
+            self.trigger_frequency_hop(reason=f"High packet loss detected ({packet_drop_rate:.0%})")
+
+    def trigger_frequency_hop(self, reason: str = "Manual Alert / Anti-Jamming Trigger") -> Dict[str, object]:
+        """Coordinates a synchronized frequency switch across all connected mesh nodes."""
+        old_chan = self.current_channel
+        curr_idx = self.channel_list.index(self.current_channel) if self.current_channel in self.channel_list else 0
+        self.current_channel = self.channel_list[(curr_idx + 1) % len(self.channel_list)]
+        self.is_jammed = False
+
+        event = {
+            "timestamp": time.time(),
+            "event": "FREQUENCY_HOP",
+            "from_channel": old_chan,
+            "to_channel": self.current_channel,
+            "reason": reason
+        }
+        self.jamming_events.insert(0, event)
+        self.jamming_events = self.jamming_events[:10]  # Store last 10 hops
+
+        log.warning("[ANTI-JAMMING AGILITY] Hopped from %s -> %s | Reason: %s", old_chan, self.current_channel, reason)
+        print(f"[ANTI-JAMMING AGILITY] Hopped from {old_chan} -> {self.current_channel}")
+        return event
+
+    def _on_metrics_snapshot(self, snap: object) -> None:
+        """Callback for MetricsSampler: evaluates state & monitors packet loss for jamming."""
+        self.state.evaluate(snap)
+        # Check packet drop rate for jamming mitigation if the snapshot provides it
+        drop_rate = getattr(snap, "packet_drop_rate", 0.0)
+        self.check_jamming_status(drop_rate)
+
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
@@ -194,12 +241,13 @@ class Node:
         ).start()
         self.gossip.start()
         log.info(
-            "node %s up on http://%s:%d (advertise=%s) udp=%d",
+            "node %s up on http://%s:%d (advertise=%s) udp=%d | channel=%s",
             self.node_id,
             self.listen_host,
             self.http_port,
             self.advertise_host,
             self.udp_port,
+            self.current_channel,
         )
 
     def stop(self) -> None:
@@ -232,6 +280,8 @@ class Node:
             "identity": self.identity.summary(),
             "state": self.state.current().value,
             "peers": self.peers.summary(),
+            "current_channel": self.current_channel,
+            "is_jammed": self.is_jammed,
             "uptime_s": int(time.time() - self.identity.started_at),
         }
 
@@ -246,6 +296,8 @@ class Node:
             "load": snap.load_score(),
             "queue_depth": snap.queue_depth,
             "req_rate_1s": snap.req_rate_1s,
+            "current_channel": self.current_channel,
+            "is_jammed": self.is_jammed,
             "uptime_s": int(time.time() - self.identity.started_at),
         }
 
@@ -273,6 +325,12 @@ class Node:
             "routing": self.routing.stats(),
             "pipeline": self.pipeline.stats(),
             "peers": self.peers.summary(),
+            "spectrum": {
+                "current_channel": self.current_channel,
+                "is_jammed": self.is_jammed,
+                "available_channels": self.channel_list,
+                "recent_hops": self.jamming_events,
+            },
         }
 
     def on_messages(self) -> Dict[str, object]:
@@ -281,6 +339,16 @@ class Node:
             "node_id": self.node_id,
             "total_logged": len(MESSAGE_LOGS),
             "messages": list(MESSAGE_LOGS),
+        }
+
+    def on_spectrum(self) -> Dict[str, object]:
+        """Returns current frequency spectrum telemetry and hopping event history."""
+        return {
+            "node_id": self.node_id,
+            "current_channel": self.current_channel,
+            "is_jammed": self.is_jammed,
+            "channel_list": self.channel_list,
+            "jamming_events": self.jamming_events,
         }
 
     def on_heartbeat(self, body: dict) -> Dict[str, object]:
@@ -321,6 +389,7 @@ class Node:
                 "node_id": self.node_id,
                 "host": self.advertise_host,
                 "http_port": self.http_port,
+                "current_channel": self.current_channel,
                 "snapshot": self.metrics.snapshot().to_dict(),
             }
         return {"ok": False, "node_id": self.node_id}
@@ -388,7 +457,7 @@ def main() -> None:
 
     node.start()
     print("\n{} @ {}:{}  ({})\n".format(node.node_id, node.advertise_host, node.http_port, node.identity.hostname))
-    print("  http://localhost:{}/health      state & congestion".format(node.http_port))
+    print("  http://localhost:{}/health      state, congestion & channel".format(node.http_port))
     print("  http://localhost:{}/peers       cluster view".format(node.http_port))
     print("  http://localhost:{}/connections active link history".format(node.http_port))
     print("  http://localhost:{}/metrics     full snapshot".format(node.http_port))
