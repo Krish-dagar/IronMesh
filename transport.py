@@ -11,7 +11,7 @@ Three cooperating parts:
 2. ``NodeHttpServer``
    A threaded ``http.server`` instance exposing the data/control endpoints:
    ``POST /submit``, ``POST /route``, ``POST /heartbeat``, ``GET /health``,
-   ``GET /peers``, ``GET /metrics``. All request logic is delegated to the
+   ``GET /peers``, ``GET /metrics``, ``GET /connections``, ``GET /messages``. All request logic is delegated to the
    injected ``app`` (see node.py / pipeline.py); this module stays I/O-only.
 
 3. ``GossipLoop``
@@ -213,14 +213,78 @@ class _NodeHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
         app = self.server.app
-        if parsed.path == "/health":
+
+        if path == "/health":
             self._json(200, app.on_health())
-        elif parsed.path == "/peers":
+        elif path == "/peers":
             self._json(200, app.on_peers())
-        elif parsed.path == "/metrics":
+        elif path == "/metrics":
             self._json(200, app.on_metrics())
-        elif parsed.path == "/":
+        elif path == "/connections":
+            try:
+                # Extract live connected peers directly from app state
+                peers_data = []
+                if hasattr(app, "peers"):
+                    # Check if peers stored as dict in self.peers.peers or self.peers
+                    raw_peers = getattr(app.peers, "peers", app.peers)
+                    if isinstance(raw_peers, dict):
+                        peers_data = list(raw_peers.values())
+                    elif isinstance(raw_peers, list):
+                        peers_data = raw_peers
+
+                # Extract connection history if logged, fallback to formatted active connections
+                conn_history = getattr(app, "connection_logs", [])
+                if not conn_history and peers_data:
+                    conn_history = []
+                    for p in peers_data:
+                        if isinstance(p, dict):
+                            conn_history.append({
+                                "peer_id": p.get("node_id", "unknown"),
+                                "host": p.get("host"),
+                                "port": p.get("port"),
+                                "status": "CONNECTED" if p.get("alive") else "DISCONNECTED",
+                                "rtt_ms": p.get("rtt_ms")
+                            })
+                        else:
+                            conn_history.append({
+                                "peer_id": getattr(p, "node_id", "unknown"),
+                                "host": getattr(p, "host", None),
+                                "port": getattr(p, "port", None),
+                                "status": "CONNECTED" if getattr(p, "alive", True) else "DISCONNECTED",
+                                "rtt_ms": getattr(p, "rtt_ms", None)
+                            })
+
+                self._json(200, {
+                    "node_id": getattr(app, "node_id", "unknown_node"),
+                    "active_peers_count": len(peers_data),
+                    "connections": list(conn_history) if isinstance(conn_history, (list, tuple)) else []
+                })
+            except Exception as e:
+                print(f"[TRANSPORT ERROR] Failed processing /connections: {e}")
+                self._json(500, {
+                    "status": "error",
+                    "message": f"Internal node error: {str(e)}"
+                })
+        elif path == "/messages":
+            try:
+                if hasattr(app, "on_messages"):
+                    self._json(200, app.on_messages())
+                else:
+                    msg_logs = getattr(app, "message_logs", [])
+                    self._json(200, {
+                        "node_id": getattr(app, "node_id", "unknown_node"),
+                        "total_messages": len(msg_logs) if isinstance(msg_logs, (list, tuple)) else 0,
+                        "messages": list(msg_logs) if isinstance(msg_logs, (list, tuple)) else []
+                    })
+            except Exception as e:
+                print(f"[TRANSPORT ERROR] Failed processing /messages: {e}")
+                self._json(500, {
+                    "status": "error",
+                    "message": f"Internal node error: {str(e)}"
+                })
+        elif path == "/":
             self._json(200, app.on_banner())
         else:
             self._json(404, {"status": "error", "error": "not found"})

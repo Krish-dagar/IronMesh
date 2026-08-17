@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # llm-node — Distributed LLM Discovery & Personalization Node
 
 A single-node implementation for a **fully decentralized mesh** of laptops
@@ -196,3 +197,7 @@ start.bat      Windows launcher
   laptop (control-plane broadcast stays LAN-only by design).
 - **Load pegged at 100%:** that's the point — it enters JAMMED and starts
   re-routing to peers. Lower `state.jam_high` if it should shed earlier.
+=======
+# IronMesh
+A shape-shifting, software-defined radio (SDR) communication stack designed to survive electronic warfare. It bypasses heavy enemy jamming by splitting data across hidden, rapidly hopping frequencies while encrypting traffic to block cyber attacks.
+>>>>>>> 57d48932efa5c05a1d8792cb0b7127cefb553e64

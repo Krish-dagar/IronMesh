@@ -1,21 +1,7 @@
 """Reference client: send discovery/personalization payloads to any node.
 
-Examples
---------
-Single request with a referral string and AI-assistant headers::
-
-    python3 client.py --url http://192.168.1.20:8080 \
-        --query 'ref=claude&intent=research&urgency=high&session=s-1' \
-        --header X-Request-Id:req_001 \
-        --text 'please prioritize this urgent request'
-
-Burst test (prove rate limiting / congestion handling)::
-
-    python3 client.py --url http://192.168.1.20:8080 \
-        --text 'burst payload' --count 500 --concurrency 20
-
-The client is a reference implementation only; any HTTP tool works
-(curl, requests, your gateway) as long as the body shape matches.
+Phase 4 Security Layer: Encapsulates ML-KEM-768 headers and encrypts
+data payloads using AES-256-GCM before transmission.
 """
 
 from __future__ import annotations
@@ -28,11 +14,18 @@ import urllib.request
 from collections import Counter
 from typing import Dict, List, Optional
 
+from security import pqc_node
+
 
 def post_json(url: str, payload: dict, timeout: float = 5.0) -> dict:
-    data = json.dumps(payload).encode("utf-8")
+    # Phase 4: Encrypt payload before sending over the wire
+    encrypted_payload = pqc_node.encrypt_payload(payload)
+    
+    data = json.dumps(encrypted_payload).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data, method="POST",
+        url,
+        data=data,
+        method="POST",
         headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -46,6 +39,12 @@ def run(args) -> None:
             k, v = h.split(":", 1)
             headers[k.strip()] = v.strip()
 
+    # Phase 4: Attach PQC ML-KEM Key Exchange Metadata to Headers
+    pqc_header = pqc_node.encapsulate_pqc_header("target_node")
+    headers["X-PQC-Alg"] = pqc_header["pqc_alg"]
+    headers["X-PQC-Ciphertext"] = pqc_header["ciphertext_b64"]
+    headers["X-PQC-SharedSecret"] = pqc_header["shared_secret_b64"]
+
     payload = {
         "query": args.query or "",
         "headers": headers,
@@ -55,7 +54,15 @@ def run(args) -> None:
 
     if args.count <= 1:
         t0 = time.time()
+        print("\n=== PQC HEADER (ML-KEM-768 Encapsulation) ===")
+        print(json.dumps(pqc_header, indent=2))
+
+        print("\n=== AES-256 ENCRYPTED PAYLOAD (IN-TRANSIT LOG) ===")
+        encrypted_preview = pqc_node.encrypt_payload(payload)
+        print(json.dumps(encrypted_preview, indent=2))
+
         resp = post_json(args.url, payload)
+        print("\n=== SERVER RESPONSE ===")
         print(json.dumps(resp, indent=2, default=str))
         print("\nround-trip: {:.0f} ms".format((time.time() - t0) * 1000))
         return
@@ -93,7 +100,7 @@ def run(args) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="llm-node reference client")
+    p = argparse.ArgumentParser(description="llm-node reference client with PQC & AES-256")
     p.add_argument("--url", default="http://127.0.0.1:8080/submit", help="node endpoint")
     p.add_argument("--query", default="", help="referral string, e.g. ref=claude&intent=research&urgency=high")
     p.add_argument("--header", action="append", default=[], help="header as K:V (repeatable)")
