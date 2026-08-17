@@ -7,7 +7,7 @@ for host:
 
 For the machines running the same:
 1.	Download the folder as it is
-2.	"python node.py --peers <host ip>:8080"
+2.	python node.py --peers <host_ip_address>:8080
 
 
 A single-node implementation for a **fully decentralized mesh** of laptops
