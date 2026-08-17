@@ -1,0 +1,15 @@
+#!/bin/bash
+# Start the LLM node. Usage:
+#   ./start.sh
+#   ./start.sh --peers 192.168.1.20:8080 192.168.1.21:8080
+
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$DIR"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required but not found on PATH" >&2
+    exit 1
+fi
+
+exec python3 node.py "$@"

@@ -1,0 +1,43 @@
+{
+  "node_id": "auto",
+  "name": "node",
+  "listen_host": "0.0.0.0",
+  "http_port": 8080,
+  "udp_port": 48765,
+  "udp_broadcast_addr": "255.255.255.255",
+  "udp_ttl": 1,
+  "peers": [],
+  "announce_interval_s": 3,
+  "heartbeat_interval_s": 2,
+  "peer_timeout_s": 8,
+  "metrics_interval_s": 1,
+  "logging": "INFO",
+  "state": {
+    "busy_high": 65,
+    "jam_high": 85,
+    "jam_exit": 55,
+    "jam_samples": 3,
+    "recover_samples": 3,
+    "max_queue": 100
+  },
+  "limits": {
+    "default_burst": 50,
+    "default_refill": 10,
+    "priority_burst": 20,
+    "aggregate_rps": 200,
+    "window_s": 5
+  },
+  "routing": {
+    "max_hops": 3,
+    "ttl_default": 5,
+    "min_peer_headroom": 15,
+    "max_forward_size_bytes": 2097152
+  },
+  "render": {
+    "default_schema": "json-schema",
+    "include_metadata": true
+  },
+  "processing": {
+    "max_work_ms": 50
+  }
+}
