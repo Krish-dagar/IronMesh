@@ -1,6 +1,18 @@
 <<<<<<< HEAD
 # llm-node — Distributed LLM Discovery & Personalization Node
 
+Procedure:
+for host:
+1.	.\start.bat
+2.	Check the wifi lan adapter ipv4 and save it as host ip
+
+For the machines running the same:
+1.	Download the folder as it is
+2.	python node.py --peers <host_ip_address>:8080
+3. Now for simulating the case of a destroyed node, kill the proces in any one of the laptops or simply turn the laptop off
+4. 
+
+
 A single-node implementation for a **fully decentralized mesh** of laptops
 (4-6 recommended). Every laptop runs the identical program; the cluster
 discovers itself, monitors its own congestion, adaptively rate-limits,
