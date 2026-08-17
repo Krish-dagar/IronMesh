@@ -4,6 +4,7 @@ Procedure:
 for host:
 1.	.\start.bat
 2.	Check the wifi lan adapter ipv4 and save it as host ip
+
 For the machines running the same:
 1.	Download the folder as it is
 2.	python node.py --peers <host ip>:8080
