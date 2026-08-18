@@ -541,6 +541,18 @@ PAGE = """<!doctype html>
   .legend .sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  
+  .reroute-banner {
+    display: none; background: rgba(240, 84, 107, 0.12); border: 1px solid rgba(240, 84, 107, 0.4);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #f87171;
+  }
+  .reroute-banner.active { display: block; animation: pulse 2s infinite ease-in-out; }
+  .reroute-path {
+    display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-weight: 700;
+    margin-top: 4px; background: rgba(0,0,0,0.3); padding: 4px 10px; border-radius: 6px; color: var(--accent);
+  }
+  .reroute-arrow { color: var(--muted); font-weight: 400; }
+  .path-blocked { color: #ef4444; text-decoration: line-through; opacity: 0.8; }
 </style>
 </head>
 <body>
@@ -562,6 +574,10 @@ PAGE = """<!doctype html>
   </header>
 
   <div class="banner" id="jamBanner">🚨 JAMMING DETECTED ON CURRENT CHANNEL! FREQUENCY HOP REQUIRED.</div>
+  <div class="reroute-banner" id="rerouteBanner">
+    <div><strong>🔀 Mesh Dynamic Reroute Triggered:</strong> <span id="rerouteReason">Local / Node congested or jammed</span></div>
+    <div id="reroutePathDisplay"></div>
+  </div>
   <div class="banner" id="banner"></div>
 
   <div class="card" id="selfCard">
@@ -815,16 +831,42 @@ function renderGraph(rootAddr, nodes, edges) {
   const pos = layout(rootAddr, nodes);
   let svg = '';
 
-  // Draw link lines with clear mesh connections
-  edges.forEach(e => {
+  const jammedNodes = new Set(nodes.filter(n => n.state === "jammed").map(n => n.addr));
+
+  // Draw link lines & animated packet transfer particles
+  edges.forEach((e, idx) => {
     const a = pos[e.a], b = pos[e.b];
     if (!a || !b) return;
     const isLive = Boolean(e.alive);
-    const stroke = isLive ? "rgba(94,234,212,0.65)" : "rgba(240,84,107,0.35)";
-    const strokeWidth = isLive ? "2" : "1.2";
-    const dash = isLive ? '' : ' stroke-dasharray="5,5"';
-    svg += '<line x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y +
+    const connectsToJammed = jammedNodes.has(e.a) || jammedNodes.has(e.b);
+    
+    let stroke = isLive ? "rgba(94,234,212,0.5)" : "rgba(240,84,107,0.35)";
+    let strokeWidth = isLive ? "2" : "1.2";
+    let dash = isLive ? '' : ' stroke-dasharray="5,5"';
+
+    if (connectsToJammed && isLive) {
+      stroke = "rgba(245,158,11,0.7)"; // Warning gold for links connected to jammed node
+      strokeWidth = "2.5";
+    }
+
+    svg += '<line id="link_' + idx + '" x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y +
       '" stroke="' + stroke + '" stroke-width="' + strokeWidth + '"' + dash + ' />';
+
+    // Animated packet flow circles traveling along live edges
+    if (isLive) {
+      const dur = (2.2 + (idx % 3) * 0.6) + 's';
+      const particleColor = connectsToJammed ? "#f59e0b" : "#5eead4";
+      
+      // Forward direction packet
+      svg += '<circle r="4" fill="' + particleColor + '">' +
+        '<animateMotion dur="' + dur + '" repeatCount="indefinite" path="M' + a.x + ',' + a.y + ' L' + b.x + ',' + b.y + '" />' +
+        '</circle>';
+
+      // Backward direction packet with offset
+      svg += '<circle r="3" fill="' + particleColor + '" opacity="0.7">' +
+        '<animateMotion dur="' + dur + '" begin="1s" repeatCount="indefinite" path="M' + b.x + ',' + b.y + ' L' + a.x + ',' + a.y + '" />' +
+        '</circle>';
+    }
   });
 
   nodes.forEach(n => {
@@ -839,6 +881,15 @@ function renderGraph(rootAddr, nodes, edges) {
     if (isRoot) {
       svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (r + 7) +
         '" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4" stroke-dasharray="4,4" />';
+    }
+
+    // Glowing aura for jammed nodes
+    if (n.state === "jammed") {
+      svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (r + 10) +
+        '" fill="none" stroke="#ef4444" stroke-width="2" opacity="0.8">' +
+        '<animate attributeName="r" values="' + (r + 5) + ';' + (r + 14) + ';' + (r + 5) + '" dur="1.5s" repeatCount="indefinite" />' +
+        '<animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.5s" repeatCount="indefinite" />' +
+        '</circle>';
     }
 
     svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + r +
@@ -885,6 +936,32 @@ async function tick() {
       renderConnections(graph.root, nodes);
       renderTable(graph.root, nodes);
       renderGraph(graph.root, nodes, graph.edges || []);
+      
+      // Update Reroute Banner & Path visualizer if any node is jammed
+      const jammedNodes = nodes.filter(n => n.state === "jammed");
+      const healthyNodes = nodes.filter(n => n.reachable && n.state !== "jammed" && n.addr !== graph.root);
+      const rootNode = nodes.find(n => n.addr === graph.root) || {};
+      const rootName = rootNode.device_name || "YOU";
+
+      const rerouteEl = document.getElementById("rerouteBanner");
+      if (jammedNodes.length > 0 && healthyNodes.length > 0) {
+        const jammed = jammedNodes[0];
+        const jName = jammed.device_name || jammed.addr;
+        const healthyPeer = healthyNodes[0];
+        const hName = healthyPeer.device_name || healthyPeer.addr;
+
+        rerouteEl.classList.add("active");
+        document.getElementById("rerouteReason").textContent = jName + " is in JAMMED state. Dynamic reroute bypass activated.";
+        document.getElementById("reroutePathDisplay").innerHTML = 
+          '<div class="reroute-path">' +
+            '<span class="path-blocked">' + rootName + ' ➔ ' + jName + '</span>' +
+            '<span class="reroute-arrow"> ───(Mesh Reroute)───► </span>' +
+            '<span>' + rootName + ' ➔ ' + hName + ' ➔ Target</span>' +
+          '</div>';
+      } else {
+        rerouteEl.classList.remove("active");
+      }
+
       // Show mesh completeness: full K_N = N*(N-1)/2 links
       const N = nodes.length;
       const maxLinks = N * (N - 1) / 2;
