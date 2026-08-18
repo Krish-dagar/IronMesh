@@ -186,7 +186,9 @@ class Node:
 
     def _has_peer(self, peer_id: str) -> bool:
         """Safely checks if a peer exists across different PeerTable internal attribute designs."""
-        if hasattr(self.peers, "peers"):
+        if hasattr(self.peers, "_peers"):
+            return peer_id in self.peers._peers
+        elif hasattr(self.peers, "peers"):
             return peer_id in self.peers.peers
         elif hasattr(self.peers, "table"):
             return peer_id in self.peers.table
@@ -380,10 +382,33 @@ class Node:
 
         if sender_id_str and sender_id_str != self.node_id and host and port:
             peer_addr = f"{host}:{port}"
+            # Evict any old ghost entry for this addr (node may have restarted with new ID)
+            self.peers.remove_stale_by_addr(host, port, keep_node_id=sender_id_str)
             if not self._has_peer(sender_id_str):
                 register_connection(sender_id_str, peer_addr, status="CONNECTED")
             self.peers.upsert(sender_id_str, host, port)
             self.peers.observe(sender_id_str, body.get("snapshot", {}) or {}, rtt_s=0.0)
+
+            # Transitive peer discovery (PEX): merge peers sent in the request
+            incoming_known_peers = body.get("known_peers", []) or []
+            for rp in incoming_known_peers:
+                r_nid = str(rp.get("node_id", ""))
+                r_host = str(rp.get("host", ""))
+                r_port = int(rp.get("port") or rp.get("http_port") or 0)
+                if r_nid and r_nid != self.node_id and r_host and r_port > 0:
+                    # Evict any stale entry at this PEX addr
+                    self.peers.remove_stale_by_addr(r_host, r_port, keep_node_id=r_nid)
+                    if not self._has_peer(r_nid):
+                        register_connection(r_nid, f"{r_host}:{r_port}", status="CONNECTED")
+                    self.peers.upsert(r_nid, r_host, r_port)
+
+            # Collect active peers to share in response
+            known_peers_list = [
+                {"node_id": p.get("node_id"), "host": p.get("host"), "port": p.get("port")}
+                for p in self.peers.summary()
+                if p.get("alive") and p.get("node_id") != self.node_id and p.get("node_id") != sender_id_str
+            ]
+
             return {
                 "ok": True,
                 "node_id": self.node_id,
@@ -391,6 +416,7 @@ class Node:
                 "http_port": self.http_port,
                 "current_channel": self.current_channel,
                 "snapshot": self.metrics.snapshot().to_dict(),
+                "known_peers": known_peers_list,
             }
         return {"ok": False, "node_id": self.node_id}
 

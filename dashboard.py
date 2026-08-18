@@ -142,8 +142,10 @@ def crawl(root_addr: str, hops: int = DEFAULT_HOPS, max_nodes: int = MAX_NODES) 
 def device_name(node_id: str) -> str:
     if not node_id:
         return ""
-    m = re.match(r"^node-(.+)-[0-9a-f]{12}$", node_id, re.IGNORECASE)
-    return m.group(1) if m else node_id
+    m = re.match(r"^node-(.+)-([0-9a-f]{6,12})$", node_id, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return node_id
 
 
 def compose_graph(crawl_result: dict) -> dict:
@@ -179,7 +181,7 @@ def compose_graph(crawl_result: dict) -> dict:
         snap = metrics.get("snapshot") or {}
         node_id = metrics.get("node_id") or health.get("node_id") or ""
         n["node_id"] = node_id
-        n["device_name"] = device_name(node_id)
+        n["device_name"] = device_name(node_id) or addr
         n["reachable"] = bool(result.get("ok"))
         n["spectrum"] = result.get("spectrum") or {}
         if n["reachable"]:
@@ -202,7 +204,7 @@ def compose_graph(crawl_result: dict) -> dict:
         n = ensure(pkey)
         if not n["node_id"] and p.get("node_id"):
             n["node_id"] = p["node_id"]
-            n["device_name"] = device_name(p["node_id"])
+            n["device_name"] = device_name(p["node_id"]) or pkey
         if not n["reachable"]:
             if n["headroom"] is None:
                 n["headroom"] = p.get("headroom")
@@ -214,28 +216,24 @@ def compose_graph(crawl_result: dict) -> dict:
         if n["fail_count"] is None and p.get("fail_count") is not None:
             n["fail_count"] = p.get("fail_count")
 
-    # Deduplicate canonical devices running on same machine
-    def _dkey(name: str) -> str:
-        return name.strip().casefold()
-
-    canonical_for_device: dict = {}
+    # Deduplicate aliases for the same node_id if needed
+    canonical_for_node: dict = {}
     for addr, n in nodes.items():
-        dname = n.get("device_name")
-        if not dname:
+        nid = n.get("node_id")
+        if not nid:
             continue
-        key = _dkey(dname)
-        current = canonical_for_device.get(key)
+        current = canonical_for_node.get(nid)
         if current is None:
-            canonical_for_device[key] = addr
+            canonical_for_node[nid] = addr
         elif addr == root:
-            canonical_for_device[key] = addr
+            canonical_for_node[nid] = addr
         elif n.get("reachable") and not nodes[current].get("reachable") and current != root:
-            canonical_for_device[key] = addr
+            canonical_for_node[nid] = addr
 
     addr_to_canonical: dict = {}
     for addr, n in nodes.items():
-        dname = n.get("device_name")
-        addr_to_canonical[addr] = canonical_for_device.get(_dkey(dname), addr) if dname else addr
+        nid = n.get("node_id")
+        addr_to_canonical[addr] = canonical_for_node.get(nid, addr) if nid else addr
 
     merged_nodes: dict = {}
     for addr, n in nodes.items():
@@ -258,7 +256,7 @@ def compose_graph(crawl_result: dict) -> dict:
 
     root = addr_to_canonical.get(root, root)
 
-    # Edge deduplication
+    # Edge deduplication from crawl peer lists
     merged_edges: dict = {}
     for e in crawl_result["edges"]:
         a = addr_to_canonical.get(e["a"], e["a"])
@@ -266,12 +264,37 @@ def compose_graph(crawl_result: dict) -> dict:
         if a == b:
             continue
         key = tuple(sorted((a, b)))
-        alive = bool(e["peer"].get("alive"))
+        alive = bool(e["peer"].get("alive", True))
         cur = merged_edges.get(key)
         if cur is None:
             merged_edges[key] = {"a": key[0], "b": key[1], "alive": alive}
         else:
             cur["alive"] = cur["alive"] or alive
+
+    # --- Full-mesh edge synthesis from connection history ---
+    # Each visited node's /connections data has link history. Use this to add
+    # edges that may not appear in live peer tables yet (e.g. right after a
+    # new node joins via PEX before the first heartbeat cycle completes).
+    node_id_to_canonical: dict = {}
+    for cadd, n in merged_nodes.items():
+        if n.get("node_id"):
+            node_id_to_canonical[n["node_id"]] = cadd
+
+    for cadd, n in merged_nodes.items():
+        for conn in (n.get("connections") or []):
+            peer_id = conn.get("peer_id") or conn.get("node_id") or ""
+            if not peer_id:
+                continue
+            peer_cadd = node_id_to_canonical.get(peer_id)
+            if not peer_cadd or peer_cadd == cadd:
+                continue
+            key = tuple(sorted((cadd, peer_cadd)))
+            status = (conn.get("status") or "").upper()
+            alive = status in ("CONNECTED", "HANDSHAKE_RECEIVED", "")
+            if key not in merged_edges:
+                merged_edges[key] = {"a": key[0], "b": key[1], "alive": alive}
+            else:
+                merged_edges[key]["alive"] = merged_edges[key]["alive"] or alive
 
     return {
         "root": root,
@@ -576,15 +599,15 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2>Topology <span class="hint">- as discovered by crawling the mesh from this node</span></h2>
+    <h2 style="display:flex;align-items:center;gap:10px;">Topology <span class="hint">- as discovered by crawling the mesh from this node</span> <span id="meshLinkCount" style="font-size:11px;font-weight:600;margin-left:auto;font-family:var(--mono);"></span></h2>
     <div id="graphWrap"><svg id="graphSvg" viewBox="0 0 760 440" xmlns="http://www.w3.org/2000/svg"></svg></div>
     <div class="legend">
       <span class="item"><span class="sw" style="background:var(--good)"></span>healthy</span>
       <span class="item"><span class="sw" style="background:var(--warn)"></span>busy</span>
       <span class="item"><span class="sw" style="background:var(--bad)"></span>jammed / recovering</span>
       <span class="item"><span class="sw" style="background:var(--muted)"></span>unknown / unreachable</span>
-      <span class="item">solid line = link reported alive &middot; dashed = reported dead</span>
-      <span class="item">dashed ring = not reached directly, only known via a peer's report</span>
+      <span class="item">solid line = link alive &middot; dashed = link dead/stale</span>
+      <span class="item">dashed ring = not reached directly, known via peer report</span>
     </div>
   </div>
 
@@ -765,20 +788,23 @@ function renderTable(rootAddr, nodes) {
 function layout(rootAddr, nodes) {
   const W = 760, H = 440, cx = W / 2, cy = H / 2;
   const pos = {};
-  const others = nodes.filter(n => n.addr !== rootAddr);
-  const rootNode = nodes.find(n => n.addr === rootAddr);
+  if (!nodes || nodes.length === 0) return pos;
 
-  if (rootNode) {
-    pos[rootAddr] = { x: cx, y: cy };
-    const R = Math.min(W, H) / 2 - 70;
-    others.forEach((n, i) => {
-      const angle = (2 * Math.PI * i) / Math.max(1, others.length) - Math.PI / 2;
-      pos[n.addr] = { x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) };
-    });
+  const sorted = nodes.slice();
+  const rootIndex = sorted.findIndex(n => n.addr === rootAddr);
+  if (rootIndex > 0) {
+    const [rootItem] = sorted.splice(rootIndex, 1);
+    sorted.unshift(rootItem);
+  }
+
+  const count = sorted.length;
+  if (count === 1) {
+    pos[sorted[0].addr] = { x: cx, y: cy };
   } else {
-    const R = Math.min(W, H) / 2 - 70;
-    nodes.forEach((n, i) => {
-      const angle = (2 * Math.PI * i) / Math.max(1, nodes.length) - Math.PI / 2;
+    // Symmetrical regular polygon layout - makes full mesh cross-links crystal clear
+    const R = Math.min(W, H) / 2 - 60;
+    sorted.forEach((n, i) => {
+      const angle = (2 * Math.PI * i) / count - Math.PI / 2;
       pos[n.addr] = { x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) };
     });
   }
@@ -789,33 +815,41 @@ function renderGraph(rootAddr, nodes, edges) {
   const pos = layout(rootAddr, nodes);
   let svg = '';
 
+  // Draw link lines with clear mesh connections
   edges.forEach(e => {
     const a = pos[e.a], b = pos[e.b];
     if (!a || !b) return;
-    const stroke = e.alive ? "rgba(94,234,212,0.55)" : "rgba(141,135,171,0.28)";
-    const dash = e.alive ? '' : ' stroke-dasharray="5,5"';
+    const isLive = Boolean(e.alive);
+    const stroke = isLive ? "rgba(94,234,212,0.65)" : "rgba(240,84,107,0.35)";
+    const strokeWidth = isLive ? "2" : "1.2";
+    const dash = isLive ? '' : ' stroke-dasharray="5,5"';
     svg += '<line x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y +
-      '" stroke="' + stroke + '" stroke-width="1.6"' + dash + ' />';
+      '" stroke="' + stroke + '" stroke-width="' + strokeWidth + '"' + dash + ' />';
   });
 
   nodes.forEach(n => {
     const p = pos[n.addr];
     if (!p) return;
     const isRoot = n.addr === rootAddr;
-    const r = isRoot ? 24 : 18;
+    const r = isRoot ? 26 : 20;
     const fill = stateColor(n.state);
     const ringDash = n.reachable ? '' : ' stroke-dasharray="3,3"';
     const label = n.device_name || n.addr;
 
-    svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + r +
-      '" fill="' + fill + '" fill-opacity="0.9" stroke="' +
-      (isRoot ? "var(--accent)" : "rgba(255,255,255,0.35)") + '" stroke-width="' + (isRoot ? 3 : 1.6) + '"' + ringDash + ' />';
+    if (isRoot) {
+      svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (r + 7) +
+        '" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4" stroke-dasharray="4,4" />';
+    }
 
-    svg += '<text x="' + p.x + '" y="' + (p.y + r + 16) + '" text-anchor="middle" font-size="11" fill="var(--text)" font-family="var(--sans)">' +
-      (label.length > 16 ? label.slice(0, 15) + '\\u2026' : label) + '</text>';
+    svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + r +
+      '" fill="' + fill + '" fill-opacity="0.95" stroke="' +
+      (isRoot ? "var(--accent)" : "rgba(255,255,255,0.4)") + '" stroke-width="' + (isRoot ? 3 : 1.8) + '"' + ringDash + ' />';
+
+    svg += '<text x="' + p.x + '" y="' + (p.y + r + 16) + '" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--text)" font-family="var(--sans)">' +
+      (label.length > 18 ? label.slice(0, 17) + '\\u2026' : label) + '</text>';
 
     if (isRoot) {
-      svg += '<text x="' + p.x + '" y="' + (p.y + 4) + '" text-anchor="middle" font-size="10" font-weight="700" fill="#0f0d1c" font-family="var(--sans)">you</text>';
+      svg += '<text x="' + p.x + '" y="' + (p.y + 4) + '" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0f0d1c" font-family="var(--sans)">YOU</text>';
     }
   });
 
@@ -838,7 +872,7 @@ async function tick() {
   const node = document.getElementById("nodeInput").value.trim() || "localhost:8080";
   document.getElementById("pollTarget").textContent = node;
   try {
-    const res = await fetch("/api/topology?node=" + encodeURIComponent(node) + "&hops=2", { cache: "no-store" });
+    const res = await fetch("/api/topology?node=" + encodeURIComponent(node) + "&hops=3", { cache: "no-store" });
     const graph = await res.json();
     const nodes = graph.nodes || [];
     const rootReachable = nodes.some(n => n.addr === graph.root && n.reachable);
@@ -851,6 +885,16 @@ async function tick() {
       renderConnections(graph.root, nodes);
       renderTable(graph.root, nodes);
       renderGraph(graph.root, nodes, graph.edges || []);
+      // Show mesh completeness: full K_N = N*(N-1)/2 links
+      const N = nodes.length;
+      const maxLinks = N * (N - 1) / 2;
+      const liveLinks = (graph.edges || []).filter(e => e.alive).length;
+      const meshEl = document.getElementById("meshLinkCount");
+      if (meshEl) {
+        const pct = maxLinks > 0 ? Math.round(100 * liveLinks / maxLinks) : 0;
+        meshEl.textContent = liveLinks + "/" + maxLinks + " links " + (pct === 100 ? "✓ full mesh" : "(" + pct + "% mesh)");
+        meshEl.style.color = pct === 100 ? "var(--good)" : pct >= 60 ? "var(--warn)" : "var(--bad)";
+      }
     }
     document.getElementById("updatedMeta").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (err) {

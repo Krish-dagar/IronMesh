@@ -37,6 +37,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 log = logging.getLogger("node.transport")
 
+# Fallback-only heuristic used by the /connections handler when a PeerTable
+# doesn't expose .summary() (e.g. a test double). A peer we've heard from
+# more recently than this is treated as connected. This is NOT the real
+# liveness timeout - that lives on PeerTable itself (peer_timeout_s) and is
+# what .summary() and .live() actually use.
+_LIVENESS_FALLBACK_S = 15.0
+
 
 def local_ip() -> str:
     """Best guess at this host's routable IP on the primary interface."""
@@ -229,17 +236,31 @@ class _NodeHandler(BaseHTTPRequestHandler):
             })
         elif path == "/connections":
             try:
-                peers_data = []
+                peers_data: list = []
                 if hasattr(app, "peers"):
-                    raw_peers = getattr(app.peers, "peers", app.peers)
-                    if isinstance(raw_peers, dict):
-                        peers_data = list(raw_peers.values())
-                    elif isinstance(raw_peers, list):
-                        peers_data = raw_peers
+                    table = app.peers
+                    # Preferred path: PeerTable already knows how to build
+                    # this correctly (uses its own liveness timeout, real
+                    # rtt_ms/headroom/fail_count, and "alive" as a real bool).
+                    # The old code reached for a nonexistent `.peers`
+                    # attribute (the real field is the private `_peers`),
+                    # which silently fell back to the PeerTable object
+                    # itself - neither a dict nor a list - so peers_data was
+                    # always empty and /connections always reported zero
+                    # links even when the mesh was fully connected.
+                    if hasattr(table, "summary") and callable(table.summary):
+                        peers_data = table.summary()
+                    else:
+                        raw_peers = getattr(table, "peers", None)
+                        if isinstance(raw_peers, dict):
+                            peers_data = list(raw_peers.values())
+                        elif isinstance(raw_peers, list):
+                            peers_data = raw_peers
 
                 conn_history = getattr(app, "connection_logs", [])
                 if not conn_history and peers_data:
                     conn_history = []
+                    now = time.time()
                     for p in peers_data:
                         if isinstance(p, dict):
                             conn_history.append({
@@ -250,12 +271,26 @@ class _NodeHandler(BaseHTTPRequestHandler):
                                 "rtt_ms": p.get("rtt_ms")
                             })
                         else:
+                            # Fallback for raw Peer-like objects. Peer.alive
+                            # is a *method* (alive(timeout_s, now) -> bool),
+                            # so getattr(p, "alive", True) used to return the
+                            # bound method itself, which is always truthy in
+                            # Python - every peer showed as CONNECTED
+                            # regardless of real liveness. We don't have
+                            # access to the table's private timeout here, so
+                            # use a conservative recency heuristic instead.
+                            last_seen = getattr(p, "last_seen", None)
+                            is_alive = (
+                                last_seen is not None
+                                and (now - last_seen) <= _LIVENESS_FALLBACK_S
+                            )
                             conn_history.append({
                                 "peer_id": getattr(p, "node_id", "unknown"),
                                 "host": getattr(p, "host", None),
                                 "port": getattr(p, "port", None),
-                                "status": "CONNECTED" if getattr(p, "alive", True) else "DISCONNECTED",
-                                "rtt_ms": getattr(p, "rtt_ms", None)
+                                "status": "CONNECTED" if is_alive else "DISCONNECTED",
+                                "rtt_ms": round(getattr(p, "rtt_s", 0.0) * 1000, 1)
+                                if getattr(p, "rtt_s", None) is not None else None,
                             })
 
                 self._json(200, {
@@ -403,39 +438,73 @@ class GossipLoop(threading.Thread):
 
     def _covered(self, host: str, port: int) -> bool:
         for p in self._table.live():
+            if p.port == port and (p.host == host or {p.host, host} <= {"127.0.0.1", "localhost", "0.0.0.0"}):
+                return True
             if p.host == host and p.port == port:
                 return True
         return False
 
     def _send_heartbeat(self, host: str, port: int) -> None:
         url = "http://{}:{}/heartbeat".format(host, port)
+        # Collect our current known active peers to share in gossip
+        known_peers_list = []
+        if hasattr(self._table, "summary") and callable(self._table.summary):
+            for p in self._table.summary():
+                if p.get("alive") and p.get("node_id") != self._node_id:
+                    known_peers_list.append({
+                        "node_id": p.get("node_id"),
+                        "host": p.get("host"),
+                        "port": p.get("port"),
+                    })
+
         payload = {
             "node_id": self._node_id,
             "host": self._host,
             "http_port": self._http_port,
             "snapshot": self._snapshot(),
+            "known_peers": known_peers_list,
         }
         resp, rtt, ok = self._client.post_json(url, payload)
         if not ok:
             self._log.debug("heartbeat to %s:%d failed", host, port)
             return
         if isinstance(resp, dict) and resp.get("node_id"):
-            if resp["node_id"] == self._node_id:
+            resp_nid = str(resp["node_id"])
+            if resp_nid == self._node_id:
                 return
-            peer = self._table.upsert(
-                str(resp["node_id"]), host, port
-            )
+            # Evict any stale entry at this addr with a different node_id (node restarted)
+            self._table.remove_stale_by_addr(host, port, keep_node_id=resp_nid)
+            peer = self._table.upsert(resp_nid, host, port)
             self._table.observe(peer.node_id, resp.get("snapshot", {}) or {}, rtt)
+
+            # Transitive peer discovery (PEX): merge peers returned by the remote node
+            remote_known_peers = resp.get("known_peers", []) or []
+            for rp in remote_known_peers:
+                r_nid = str(rp.get("node_id", ""))
+                r_host = str(rp.get("host", ""))
+                r_port = int(rp.get("port") or rp.get("http_port") or 0)
+                if r_nid and r_nid != self._node_id and r_host and r_port > 0:
+                    if not self._covered(r_host, r_port):
+                        # Also evict any stale entry at this PEX addr
+                        self._table.remove_stale_by_addr(r_host, r_port, keep_node_id=r_nid)
+                        self._table.upsert(r_nid, r_host, r_port)
 
     def run(self) -> None:
         while not self._stop.is_set():
             try:
-                for peer in self._table.live():
-                    if peer.node_id != self._node_id:
-                        self._send_heartbeat(peer.host, peer.port)
+                targets = []
+                seen_targets = set()
+                for peer in self._table.all():
+                    if peer.node_id != self._node_id and (peer.host, peer.port) not in seen_targets:
+                        targets.append((peer.host, peer.port))
+                        seen_targets.add((peer.host, peer.port))
                 for (host, port) in list(self._seeds):
-                    if not self._covered(host, port):
-                        self._send_heartbeat(host, port)
+                    if (host, port) not in seen_targets and not (port == self._http_port and host in ("127.0.0.1", "localhost")):
+                        targets.append((host, port))
+                        seen_targets.add((host, port))
+
+                for (host, port) in targets:
+                    self._send_heartbeat(host, port)
             except Exception as exc:
                 self._log.warning("gossip cycle error: %s", exc)
             self._stop.wait(self._interval)

@@ -107,6 +107,22 @@ class PeerTable:
                 if peer.fail_count >= 3:
                     peer.snapshot = None  # stop routing to it
 
+    def remove_stale_by_addr(self, host: str, port: int, keep_node_id: str) -> None:
+        """Evict any peer at (host, port) whose node_id is NOT keep_node_id.
+
+        Called after we receive a heartbeat response with a new node_id from
+        an address we already know — meaning the remote node restarted and got
+        a new identity.  Without this, the old ghost entry keeps being gossiped
+        via PEX and creates duplicate nodes in the dashboard.
+        """
+        with self._lock:
+            stale = [
+                nid for nid, p in self._peers.items()
+                if p.host == host and p.port == port and nid != keep_node_id
+            ]
+            for nid in stale:
+                del self._peers[nid]
+
     def live(self) -> List[Peer]:
         now = time.time()
         with self._lock:
@@ -177,17 +193,19 @@ class RoutingSwitch:
 
         if ctx.urgency == "high":
             best = min(candidates, key=lambda p: p.rtt_s)
-            # TRUE MESH: If we have ANY queue at all, instantly reroute to the fastest peer.
-            if local_jammed or local_snapshot.queue_depth > 0:
+            # TRUE MESH: If local node is jammed, has queue, or lacks headroom, reroute to fastest peer.
+            if local_jammed or (local_snapshot and local_snapshot.queue_depth > 0) or local_headroom < self._min_headroom:
                 return best, "urgent-mesh-reroute"
             return "local", "urgent-local-idle"
         else:
             best = max(candidates, key=lambda p: p.snapshot.headroom())
-            # TRUE MESH: Actively hunt for the most idle node. If a peer has just 5% more free space than us, forward it.
-            if best.snapshot.headroom() > local_headroom + 5.0:
-                return best, "bulk-mesh-reroute"
+            # Offload bulk work if local node is jammed, queued, or significantly constrained
             if local_jammed:
                 return best, "bulk-offload-jammed"
+            if local_headroom < self._min_headroom or (local_snapshot and local_snapshot.queue_depth > 0):
+                return best, "bulk-mesh-reroute"
+            if best.snapshot.headroom() > local_headroom + 25.0 and local_headroom < 60.0:
+                return best, "bulk-mesh-reroute"
             return "local", "bulk-local-balanced"
 
     def validate_hop(self, ctx: Context) -> bool:
