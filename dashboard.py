@@ -142,10 +142,8 @@ def crawl(root_addr: str, hops: int = DEFAULT_HOPS, max_nodes: int = MAX_NODES) 
 def device_name(node_id: str) -> str:
     if not node_id:
         return ""
-    m = re.match(r"^node-(.+)-([0-9a-f]{6,12})$", node_id, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return node_id
+    m = re.match(r"^node-(.+)-[0-9a-f]{12}$", node_id, re.IGNORECASE)
+    return m.group(1) if m else node_id
 
 
 def compose_graph(crawl_result: dict) -> dict:
@@ -181,7 +179,7 @@ def compose_graph(crawl_result: dict) -> dict:
         snap = metrics.get("snapshot") or {}
         node_id = metrics.get("node_id") or health.get("node_id") or ""
         n["node_id"] = node_id
-        n["device_name"] = device_name(node_id) or addr
+        n["device_name"] = device_name(node_id)
         n["reachable"] = bool(result.get("ok"))
         n["spectrum"] = result.get("spectrum") or {}
         if n["reachable"]:
@@ -204,7 +202,7 @@ def compose_graph(crawl_result: dict) -> dict:
         n = ensure(pkey)
         if not n["node_id"] and p.get("node_id"):
             n["node_id"] = p["node_id"]
-            n["device_name"] = device_name(p["node_id"]) or pkey
+            n["device_name"] = device_name(p["node_id"])
         if not n["reachable"]:
             if n["headroom"] is None:
                 n["headroom"] = p.get("headroom")
@@ -216,24 +214,28 @@ def compose_graph(crawl_result: dict) -> dict:
         if n["fail_count"] is None and p.get("fail_count") is not None:
             n["fail_count"] = p.get("fail_count")
 
-    # Deduplicate aliases for the same node_id if needed
-    canonical_for_node: dict = {}
+    # Deduplicate canonical devices running on same machine
+    def _dkey(name: str) -> str:
+        return name.strip().casefold()
+
+    canonical_for_device: dict = {}
     for addr, n in nodes.items():
-        nid = n.get("node_id")
-        if not nid:
+        dname = n.get("device_name")
+        if not dname:
             continue
-        current = canonical_for_node.get(nid)
+        key = _dkey(dname)
+        current = canonical_for_device.get(key)
         if current is None:
-            canonical_for_node[nid] = addr
+            canonical_for_device[key] = addr
         elif addr == root:
-            canonical_for_node[nid] = addr
+            canonical_for_device[key] = addr
         elif n.get("reachable") and not nodes[current].get("reachable") and current != root:
-            canonical_for_node[nid] = addr
+            canonical_for_device[key] = addr
 
     addr_to_canonical: dict = {}
     for addr, n in nodes.items():
-        nid = n.get("node_id")
-        addr_to_canonical[addr] = canonical_for_node.get(nid, addr) if nid else addr
+        dname = n.get("device_name")
+        addr_to_canonical[addr] = canonical_for_device.get(_dkey(dname), addr) if dname else addr
 
     merged_nodes: dict = {}
     for addr, n in nodes.items():
@@ -256,7 +258,7 @@ def compose_graph(crawl_result: dict) -> dict:
 
     root = addr_to_canonical.get(root, root)
 
-    # Edge deduplication from crawl peer lists
+    # Edge deduplication
     merged_edges: dict = {}
     for e in crawl_result["edges"]:
         a = addr_to_canonical.get(e["a"], e["a"])
@@ -264,37 +266,12 @@ def compose_graph(crawl_result: dict) -> dict:
         if a == b:
             continue
         key = tuple(sorted((a, b)))
-        alive = bool(e["peer"].get("alive", True))
+        alive = bool(e["peer"].get("alive"))
         cur = merged_edges.get(key)
         if cur is None:
             merged_edges[key] = {"a": key[0], "b": key[1], "alive": alive}
         else:
             cur["alive"] = cur["alive"] or alive
-
-    # --- Full-mesh edge synthesis from connection history ---
-    # Each visited node's /connections data has link history. Use this to add
-    # edges that may not appear in live peer tables yet (e.g. right after a
-    # new node joins via PEX before the first heartbeat cycle completes).
-    node_id_to_canonical: dict = {}
-    for cadd, n in merged_nodes.items():
-        if n.get("node_id"):
-            node_id_to_canonical[n["node_id"]] = cadd
-
-    for cadd, n in merged_nodes.items():
-        for conn in (n.get("connections") or []):
-            peer_id = conn.get("peer_id") or conn.get("node_id") or ""
-            if not peer_id:
-                continue
-            peer_cadd = node_id_to_canonical.get(peer_id)
-            if not peer_cadd or peer_cadd == cadd:
-                continue
-            key = tuple(sorted((cadd, peer_cadd)))
-            status = (conn.get("status") or "").upper()
-            alive = status in ("CONNECTED", "HANDSHAKE_RECEIVED", "")
-            if key not in merged_edges:
-                merged_edges[key] = {"a": key[0], "b": key[1], "alive": alive}
-            else:
-                merged_edges[key]["alive"] = merged_edges[key]["alive"] or alive
 
     return {
         "root": root,
@@ -541,18 +518,6 @@ PAGE = """<!doctype html>
   .legend .sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
-  
-  .reroute-banner {
-    display: none; background: rgba(240, 84, 107, 0.12); border: 1px solid rgba(240, 84, 107, 0.4);
-    border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; font-size: 13px; color: #f87171;
-  }
-  .reroute-banner.active { display: block; animation: pulse 2s infinite ease-in-out; }
-  .reroute-path {
-    display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-weight: 700;
-    margin-top: 4px; background: rgba(0,0,0,0.3); padding: 4px 10px; border-radius: 6px; color: var(--accent);
-  }
-  .reroute-arrow { color: var(--muted); font-weight: 400; }
-  .path-blocked { color: #ef4444; text-decoration: line-through; opacity: 0.8; }
 </style>
 </head>
 <body>
@@ -574,10 +539,6 @@ PAGE = """<!doctype html>
   </header>
 
   <div class="banner" id="jamBanner">🚨 JAMMING DETECTED ON CURRENT CHANNEL! FREQUENCY HOP REQUIRED.</div>
-  <div class="reroute-banner" id="rerouteBanner">
-    <div><strong>🔀 Mesh Dynamic Reroute Triggered:</strong> <span id="rerouteReason">Local / Node congested or jammed</span></div>
-    <div id="reroutePathDisplay"></div>
-  </div>
   <div class="banner" id="banner"></div>
 
   <div class="card" id="selfCard">
@@ -615,15 +576,15 @@ PAGE = """<!doctype html>
   </div>
 
   <div class="card">
-    <h2 style="display:flex;align-items:center;gap:10px;">Topology <span class="hint">- as discovered by crawling the mesh from this node</span> <span id="meshLinkCount" style="font-size:11px;font-weight:600;margin-left:auto;font-family:var(--mono);"></span></h2>
+    <h2>Topology <span class="hint">- as discovered by crawling the mesh from this node</span></h2>
     <div id="graphWrap"><svg id="graphSvg" viewBox="0 0 760 440" xmlns="http://www.w3.org/2000/svg"></svg></div>
     <div class="legend">
       <span class="item"><span class="sw" style="background:var(--good)"></span>healthy</span>
       <span class="item"><span class="sw" style="background:var(--warn)"></span>busy</span>
       <span class="item"><span class="sw" style="background:var(--bad)"></span>jammed / recovering</span>
       <span class="item"><span class="sw" style="background:var(--muted)"></span>unknown / unreachable</span>
-      <span class="item">solid line = link alive &middot; dashed = link dead/stale</span>
-      <span class="item">dashed ring = not reached directly, known via peer report</span>
+      <span class="item">solid line = link reported alive &middot; dashed = reported dead</span>
+      <span class="item">dashed ring = not reached directly, only known via a peer's report</span>
     </div>
   </div>
 
@@ -804,23 +765,20 @@ function renderTable(rootAddr, nodes) {
 function layout(rootAddr, nodes) {
   const W = 760, H = 440, cx = W / 2, cy = H / 2;
   const pos = {};
-  if (!nodes || nodes.length === 0) return pos;
+  const others = nodes.filter(n => n.addr !== rootAddr);
+  const rootNode = nodes.find(n => n.addr === rootAddr);
 
-  const sorted = nodes.slice();
-  const rootIndex = sorted.findIndex(n => n.addr === rootAddr);
-  if (rootIndex > 0) {
-    const [rootItem] = sorted.splice(rootIndex, 1);
-    sorted.unshift(rootItem);
-  }
-
-  const count = sorted.length;
-  if (count === 1) {
-    pos[sorted[0].addr] = { x: cx, y: cy };
+  if (rootNode) {
+    pos[rootAddr] = { x: cx, y: cy };
+    const R = Math.min(W, H) / 2 - 70;
+    others.forEach((n, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(1, others.length) - Math.PI / 2;
+      pos[n.addr] = { x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) };
+    });
   } else {
-    // Symmetrical regular polygon layout - makes full mesh cross-links crystal clear
-    const R = Math.min(W, H) / 2 - 60;
-    sorted.forEach((n, i) => {
-      const angle = (2 * Math.PI * i) / count - Math.PI / 2;
+    const R = Math.min(W, H) / 2 - 70;
+    nodes.forEach((n, i) => {
+      const angle = (2 * Math.PI * i) / Math.max(1, nodes.length) - Math.PI / 2;
       pos[n.addr] = { x: cx + R * Math.cos(angle), y: cy + R * Math.sin(angle) };
     });
   }
@@ -831,76 +789,33 @@ function renderGraph(rootAddr, nodes, edges) {
   const pos = layout(rootAddr, nodes);
   let svg = '';
 
-  const jammedNodes = new Set(nodes.filter(n => n.state === "jammed").map(n => n.addr));
-
-  // Draw link lines & animated packet transfer particles
-  edges.forEach((e, idx) => {
+  edges.forEach(e => {
     const a = pos[e.a], b = pos[e.b];
     if (!a || !b) return;
-    const isLive = Boolean(e.alive);
-    const connectsToJammed = jammedNodes.has(e.a) || jammedNodes.has(e.b);
-    
-    let stroke = isLive ? "rgba(94,234,212,0.5)" : "rgba(240,84,107,0.35)";
-    let strokeWidth = isLive ? "2" : "1.2";
-    let dash = isLive ? '' : ' stroke-dasharray="5,5"';
-
-    if (connectsToJammed && isLive) {
-      stroke = "rgba(245,158,11,0.7)"; // Warning gold for links connected to jammed node
-      strokeWidth = "2.5";
-    }
-
-    svg += '<line id="link_' + idx + '" x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y +
-      '" stroke="' + stroke + '" stroke-width="' + strokeWidth + '"' + dash + ' />';
-
-    // Animated packet flow circles traveling along live edges
-    if (isLive) {
-      const dur = (2.2 + (idx % 3) * 0.6) + 's';
-      const particleColor = connectsToJammed ? "#f59e0b" : "#5eead4";
-      
-      // Forward direction packet
-      svg += '<circle r="4" fill="' + particleColor + '">' +
-        '<animateMotion dur="' + dur + '" repeatCount="indefinite" path="M' + a.x + ',' + a.y + ' L' + b.x + ',' + b.y + '" />' +
-        '</circle>';
-
-      // Backward direction packet with offset
-      svg += '<circle r="3" fill="' + particleColor + '" opacity="0.7">' +
-        '<animateMotion dur="' + dur + '" begin="1s" repeatCount="indefinite" path="M' + b.x + ',' + b.y + ' L' + a.x + ',' + a.y + '" />' +
-        '</circle>';
-    }
+    const stroke = e.alive ? "rgba(94,234,212,0.55)" : "rgba(141,135,171,0.28)";
+    const dash = e.alive ? '' : ' stroke-dasharray="5,5"';
+    svg += '<line x1="' + a.x + '" y1="' + a.y + '" x2="' + b.x + '" y2="' + b.y +
+      '" stroke="' + stroke + '" stroke-width="1.6"' + dash + ' />';
   });
 
   nodes.forEach(n => {
     const p = pos[n.addr];
     if (!p) return;
     const isRoot = n.addr === rootAddr;
-    const r = isRoot ? 26 : 20;
+    const r = isRoot ? 24 : 18;
     const fill = stateColor(n.state);
     const ringDash = n.reachable ? '' : ' stroke-dasharray="3,3"';
     const label = n.device_name || n.addr;
 
-    if (isRoot) {
-      svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (r + 7) +
-        '" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-opacity="0.4" stroke-dasharray="4,4" />';
-    }
-
-    // Glowing aura for jammed nodes
-    if (n.state === "jammed") {
-      svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + (r + 10) +
-        '" fill="none" stroke="#ef4444" stroke-width="2" opacity="0.8">' +
-        '<animate attributeName="r" values="' + (r + 5) + ';' + (r + 14) + ';' + (r + 5) + '" dur="1.5s" repeatCount="indefinite" />' +
-        '<animate attributeName="opacity" values="0.8;0.2;0.8" dur="1.5s" repeatCount="indefinite" />' +
-        '</circle>';
-    }
-
     svg += '<circle cx="' + p.x + '" cy="' + p.y + '" r="' + r +
-      '" fill="' + fill + '" fill-opacity="0.95" stroke="' +
-      (isRoot ? "var(--accent)" : "rgba(255,255,255,0.4)") + '" stroke-width="' + (isRoot ? 3 : 1.8) + '"' + ringDash + ' />';
+      '" fill="' + fill + '" fill-opacity="0.9" stroke="' +
+      (isRoot ? "var(--accent)" : "rgba(255,255,255,0.35)") + '" stroke-width="' + (isRoot ? 3 : 1.6) + '"' + ringDash + ' />';
 
-    svg += '<text x="' + p.x + '" y="' + (p.y + r + 16) + '" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--text)" font-family="var(--sans)">' +
-      (label.length > 18 ? label.slice(0, 17) + '\\u2026' : label) + '</text>';
+    svg += '<text x="' + p.x + '" y="' + (p.y + r + 16) + '" text-anchor="middle" font-size="11" fill="var(--text)" font-family="var(--sans)">' +
+      (label.length > 16 ? label.slice(0, 15) + '\\u2026' : label) + '</text>';
 
     if (isRoot) {
-      svg += '<text x="' + p.x + '" y="' + (p.y + 4) + '" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0f0d1c" font-family="var(--sans)">YOU</text>';
+      svg += '<text x="' + p.x + '" y="' + (p.y + 4) + '" text-anchor="middle" font-size="10" font-weight="700" fill="#0f0d1c" font-family="var(--sans)">you</text>';
     }
   });
 
@@ -923,7 +838,7 @@ async function tick() {
   const node = document.getElementById("nodeInput").value.trim() || "localhost:8080";
   document.getElementById("pollTarget").textContent = node;
   try {
-    const res = await fetch("/api/topology?node=" + encodeURIComponent(node) + "&hops=3", { cache: "no-store" });
+    const res = await fetch("/api/topology?node=" + encodeURIComponent(node) + "&hops=2", { cache: "no-store" });
     const graph = await res.json();
     const nodes = graph.nodes || [];
     const rootReachable = nodes.some(n => n.addr === graph.root && n.reachable);
@@ -936,42 +851,6 @@ async function tick() {
       renderConnections(graph.root, nodes);
       renderTable(graph.root, nodes);
       renderGraph(graph.root, nodes, graph.edges || []);
-      
-      // Update Reroute Banner & Path visualizer if any node is jammed
-      const jammedNodes = nodes.filter(n => n.state === "jammed");
-      const healthyNodes = nodes.filter(n => n.reachable && n.state !== "jammed" && n.addr !== graph.root);
-      const rootNode = nodes.find(n => n.addr === graph.root) || {};
-      const rootName = rootNode.device_name || "YOU";
-
-      const rerouteEl = document.getElementById("rerouteBanner");
-      if (jammedNodes.length > 0 && healthyNodes.length > 0) {
-        const jammed = jammedNodes[0];
-        const jName = jammed.device_name || jammed.addr;
-        const healthyPeer = healthyNodes[0];
-        const hName = healthyPeer.device_name || healthyPeer.addr;
-
-        rerouteEl.classList.add("active");
-        document.getElementById("rerouteReason").textContent = jName + " is in JAMMED state. Dynamic reroute bypass activated.";
-        document.getElementById("reroutePathDisplay").innerHTML = 
-          '<div class="reroute-path">' +
-            '<span class="path-blocked">' + rootName + ' ➔ ' + jName + '</span>' +
-            '<span class="reroute-arrow"> ───(Mesh Reroute)───► </span>' +
-            '<span>' + rootName + ' ➔ ' + hName + ' ➔ Target</span>' +
-          '</div>';
-      } else {
-        rerouteEl.classList.remove("active");
-      }
-
-      // Show mesh completeness: full K_N = N*(N-1)/2 links
-      const N = nodes.length;
-      const maxLinks = N * (N - 1) / 2;
-      const liveLinks = (graph.edges || []).filter(e => e.alive).length;
-      const meshEl = document.getElementById("meshLinkCount");
-      if (meshEl) {
-        const pct = maxLinks > 0 ? Math.round(100 * liveLinks / maxLinks) : 0;
-        meshEl.textContent = liveLinks + "/" + maxLinks + " links " + (pct === 100 ? "✓ full mesh" : "(" + pct + "% mesh)");
-        meshEl.style.color = pct === 100 ? "var(--good)" : pct >= 60 ? "var(--warn)" : "var(--bad)";
-      }
     }
     document.getElementById("updatedMeta").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (err) {

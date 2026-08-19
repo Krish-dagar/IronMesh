@@ -42,4 +42,23 @@ class PQCSecurityLayer:
         plaintext = aesgcm.decrypt(nonce, ciphertext, None)
         return json.loads(plaintext.decode("utf-8"))
 
+    def pack_message(self, sender_id: str, target_peer: str, msg_type: str, content: str) -> dict:
+        """Packs a text or audio message with ML-KEM-768 header + AES-256 encrypted payload."""
+        import time
+        header = self.encapsulate_pqc_header(target_peer)
+        raw_payload = {
+            "sender_id": sender_id,
+            "target_peer": target_peer,
+            "type": msg_type,  # "text" or "audio"
+            "content": content,  # text string or base64 audio string
+            "timestamp": time.time(),
+            "pqc_header": header
+        }
+        encrypted = self.encrypt_payload(raw_payload)
+        encrypted["pqc_header"] = header
+        encrypted["sender_id"] = sender_id
+        encrypted["target_peer"] = target_peer
+        return encrypted
+
+
 pqc_node = PQCSecurityLayer()

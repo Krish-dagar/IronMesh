@@ -438,73 +438,39 @@ class GossipLoop(threading.Thread):
 
     def _covered(self, host: str, port: int) -> bool:
         for p in self._table.live():
-            if p.port == port and (p.host == host or {p.host, host} <= {"127.0.0.1", "localhost", "0.0.0.0"}):
-                return True
             if p.host == host and p.port == port:
                 return True
         return False
 
     def _send_heartbeat(self, host: str, port: int) -> None:
         url = "http://{}:{}/heartbeat".format(host, port)
-        # Collect our current known active peers to share in gossip
-        known_peers_list = []
-        if hasattr(self._table, "summary") and callable(self._table.summary):
-            for p in self._table.summary():
-                if p.get("alive") and p.get("node_id") != self._node_id:
-                    known_peers_list.append({
-                        "node_id": p.get("node_id"),
-                        "host": p.get("host"),
-                        "port": p.get("port"),
-                    })
-
         payload = {
             "node_id": self._node_id,
             "host": self._host,
             "http_port": self._http_port,
             "snapshot": self._snapshot(),
-            "known_peers": known_peers_list,
         }
         resp, rtt, ok = self._client.post_json(url, payload)
         if not ok:
             self._log.debug("heartbeat to %s:%d failed", host, port)
             return
         if isinstance(resp, dict) and resp.get("node_id"):
-            resp_nid = str(resp["node_id"])
-            if resp_nid == self._node_id:
+            if resp["node_id"] == self._node_id:
                 return
-            # Evict any stale entry at this addr with a different node_id (node restarted)
-            self._table.remove_stale_by_addr(host, port, keep_node_id=resp_nid)
-            peer = self._table.upsert(resp_nid, host, port)
+            peer = self._table.upsert(
+                str(resp["node_id"]), host, port
+            )
             self._table.observe(peer.node_id, resp.get("snapshot", {}) or {}, rtt)
-
-            # Transitive peer discovery (PEX): merge peers returned by the remote node
-            remote_known_peers = resp.get("known_peers", []) or []
-            for rp in remote_known_peers:
-                r_nid = str(rp.get("node_id", ""))
-                r_host = str(rp.get("host", ""))
-                r_port = int(rp.get("port") or rp.get("http_port") or 0)
-                if r_nid and r_nid != self._node_id and r_host and r_port > 0:
-                    if not self._covered(r_host, r_port):
-                        # Also evict any stale entry at this PEX addr
-                        self._table.remove_stale_by_addr(r_host, r_port, keep_node_id=r_nid)
-                        self._table.upsert(r_nid, r_host, r_port)
 
     def run(self) -> None:
         while not self._stop.is_set():
             try:
-                targets = []
-                seen_targets = set()
-                for peer in self._table.all():
-                    if peer.node_id != self._node_id and (peer.host, peer.port) not in seen_targets:
-                        targets.append((peer.host, peer.port))
-                        seen_targets.add((peer.host, peer.port))
+                for peer in self._table.live():
+                    if peer.node_id != self._node_id:
+                        self._send_heartbeat(peer.host, peer.port)
                 for (host, port) in list(self._seeds):
-                    if (host, port) not in seen_targets and not (port == self._http_port and host in ("127.0.0.1", "localhost")):
-                        targets.append((host, port))
-                        seen_targets.add((host, port))
-
-                for (host, port) in targets:
-                    self._send_heartbeat(host, port)
+                    if not self._covered(host, port):
+                        self._send_heartbeat(host, port)
             except Exception as exc:
                 self._log.warning("gossip cycle error: %s", exc)
             self._stop.wait(self._interval)
